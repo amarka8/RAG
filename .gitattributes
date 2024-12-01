@@ -1,0 +1,2 @@
+data/musique/musique_facebook_contriever_proposition_ip_norm.index filter=lfs diff=lfs merge=lfs -text
+data/musique/musique_facebook_contriever_proposition_vectors_norm.npy filter=lfs diff=lfs merge=lfs -text
