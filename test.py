@@ -8,6 +8,7 @@ import os
 import argparse
 import json
 import numpy as np
+import time
 
 import faiss
 import torch
@@ -19,7 +20,8 @@ import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
 
 from langchain_core.messages import SystemMessage, HumanMessage
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate, FewShotChatMessagePromptTemplate
+import openai
 import tiktoken
 from langchain_openai import ChatOpenAI
 from dotenv import load_dotenv
@@ -29,63 +31,6 @@ Methods for multistep retrieval
 """
 
 enc = tiktoken.encoding_for_model("gpt-3.5-turbo")
-
-def num_tokens_by_tiktoken(text: str):
-    return len(enc.encode(text))
-
-def merge_elements_with_same_first_line(elements, prefix='Wikipedia Title: '):
-    merged_dict = {}
-
-    # Iterate through each element in the list
-    for element in elements:
-        # Split the element into lines and get the first line
-        lines = element.split('\n')
-        first_line = lines[0]
-
-        # Check if the first line is already a key in the dictionary
-        if first_line in merged_dict:
-            # Append the current element to the existing value
-            merged_dict[first_line] += "\n" + element.split(first_line, 1)[1].strip('\n')
-        else:
-            # Add the current element as a new entry in the dictionary
-            merged_dict[first_line] = prefix + element
-
-    # Extract the merged elements from the dictionary
-    merged_elements = list(merged_dict.values())
-    return merged_elements
-
-ircot_reason_instruction = 'You serve as an intelligent assistant, adept at facilitating users through complex, multi-hop reasoning across multiple documents. This task is illustrated through demonstrations, each consisting of a document set paired with a relevant question and its multi-hop reasoning thoughts. Your task is to generate one thought for current step, DON\'T generate the whole thoughts at once! If you reach what you believe to be the final step, start with "So the answer is:".'
-
-def reason_step(dataset, few_shot: list, query: str, passages: list, thoughts: list, client):
-    """
-    Given few-shot samples, query, previous retrieved passages, and previous thoughts, generate the next thought with LangChain LLM.
-    The generated thought is used for further retrieval step.
-    :return: next thought
-    """
-    prompt_demo = ''
-
-    prompt_user = ''
-    if dataset in ['hotpotqa']:
-        passages = merge_elements_with_same_first_line(passages)
-    for passage in passages:
-        prompt_user += f'Wikipedia Title: {passage}\n\n'
-    prompt_user += f'Question: {query}\nThought:' + ' '.join(thoughts)
-
-    for sample in few_shot:
-        cur_sample = f'{sample["document"]}\n\nQuestion: {sample["question"]}\nThought: {sample["thought_and_answer"]}\n\n'
-        if num_tokens_by_tiktoken(ircot_reason_instruction + prompt_demo + cur_sample + prompt_user) < 15000:
-            prompt_demo += cur_sample
-
-    messages = ChatPromptTemplate.from_messages([SystemMessage(ircot_reason_instruction + '\n\n' + prompt_demo),
-                                                 HumanMessage(prompt_user)]).format_prompt()
-
-    try:
-        chat_completion = client.invoke(messages.to_messages())
-        response_content = chat_completion.content
-    except Exception as e:
-        print(e)
-        return ''
-    return response_content
 
 def parse_prompt(file_path: str, has_context=True):
     with open(file_path, 'r', encoding='utf-8') as file:
@@ -135,6 +80,116 @@ def parse_prompt(file_path: str, has_context=True):
     return parsed_data
 
 
+def num_tokens_by_tiktoken(text: str):
+    return len(enc.encode(text))
+
+def merge_elements_with_same_first_line(elements, prefix='Wikipedia Title: '):
+    merged_dict = {}
+
+    # Iterate through each element in the list
+    for element in elements:
+        # Split the element into lines and get the first line
+        lines = element.split('\n')
+        first_line = lines[0]
+
+        # Check if the first line is already a key in the dictionary
+        if first_line in merged_dict:
+            # Append the current element to the existing value
+            merged_dict[first_line] += "\n" + element.split(first_line, 1)[1].strip('\n')
+        else:
+            # Add the current element as a new entry in the dictionary
+            merged_dict[first_line] = prefix + element
+
+    # Extract the merged elements from the dictionary
+    merged_elements = list(merged_dict.values())
+    return merged_elements
+
+ircot_reason_instruction = 'You serve as an intelligent assistant, adept at facilitating users through complex, multi-hop reasoning across multiple documents. Your task is to generate the next thought for the current step, DON\'T generate all thoughts at once! If you reach what you believe to be the final step, start with "So the answer is:".'
+
+def reason_step(dataset, few_shot: list, query: str, passages: list, thoughts: list, client):
+    """
+    Given few-shot samples, query, previous retrieved passages, and previous thoughts, generate the next thought with LangChain LLM.
+    The generated thought is used for further retrieval step.
+    :return: next thought
+    """
+    prompt_demo = ''
+
+    prompt_user = ''
+    if dataset in ['hotpotqa']:
+        passages = merge_elements_with_same_first_line(passages)
+        
+    #put into the format of documents in IRCOT tests
+    for passage in passages:
+        prompt_user += f'Wikipedia Title: {passage}\n\n'
+    prompt_user += f'Question: {query}\nThought:' + ' '.join(thoughts)
+
+    # print("Passages: ")
+    # print(passages)
+    
+    # print("Prompt User:")
+    # print(prompt_user)
+
+    # print("Cur_sample:")
+
+    examples = []
+    for sample in few_shot:
+        cur_sample = f'{sample["document"]}\n\nQuestion: {sample["question"]}\nThought: {sample["thought_and_answer"]}\n\n'
+        if num_tokens_by_tiktoken(ircot_reason_instruction + prompt_demo + cur_sample + prompt_user) < 15000:
+                examples.append({"input": f'{sample["document"]}\n\nQuestion: {sample["question"]}\nThought: '+sample["thought"], "output": sample["thought_and_answer"]})
+
+    # print(examples)
+
+    # print(cur_sample)
+
+    # print("Prompt Demo:")
+    # print(prompt_demo)
+
+    example_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("human", "{input}"),
+            ("ai", "{output}"),
+        ]
+    )
+
+    # print("input")
+    # print(f'{sample["document"]}\n\nQuestion: {sample["question"]}')
+
+    # print("output")
+    # print(sample["thought_and_answer"])
+
+
+
+    few_shot_prompt = FewShotChatMessagePromptTemplate(
+        example_prompt=example_prompt,
+        examples=examples,
+    )
+
+    final_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", ircot_reason_instruction),
+            few_shot_prompt,
+            ("human", "{input}"),
+        ]
+    )
+
+
+#     messages = ChatPromptTemplate([("system", ircot_reason_instruction + '\n\n' + prompt_demo),
+#                                                  ("human", "{prompt_user}")])
+    # print(messages.to_messages())
+
+    for retry in range(5):
+        try:
+            chain = final_prompt | client
+            chat_completion = chain.invoke({"input":prompt_user})
+            response_content = chat_completion.content
+            return response_content
+            # print(response_content)
+        except openai.RateLimitError as e:
+            print("Rate Limit Exceeded. Trying again")
+            wait_time = 2 ** retry  # Exponential backoff
+            time.sleep(wait_time)
+
+
 
 
 """
@@ -147,12 +202,17 @@ def mean_pooling(tokenEmbeddings, paddingInfo):
     return sentenceEmbeddings
 
 def mean_pooling_embedding_with_normalization(batch_str, tokenizer, model):
-    mps_device = torch.device("mps") 
     encoding = tokenizer(batch_str, padding=True, truncation=True, return_tensors='pt').to(mps_device)
     input_ids = encoding['input_ids']
     attention_mask = encoding['attention_mask']
-    input_ids = input_ids.to(mps_device)
-    attention_mask = attention_mask.to(mps_device)
+    if(torch.cuda.is_available()):
+        cuda_device = torch.device("cuda") 
+        input_ids = input_ids.to(cuda_device)
+        attention_mask = attention_mask.to(cuda_device)
+    else:
+        cuda_device = torch.device("cpu") 
+        input_ids = input_ids.to(cuda_device)
+        attention_mask = attention_mask.to(cuda_device)
     outputs = model(input_ids, attention_mask=attention_mask)
     sentenceEmbeddings = mean_pooling(outputs[0], attention_mask)
     sentenceEmbeddingsNorm = sentenceEmbeddings.divide(torch.linalg.norm(sentenceEmbeddings,dim = 1)[...,None])
@@ -186,6 +246,7 @@ def process_sample(idx, sample, dataset, top_k, k_list,max_steps, few_shot_sampl
         print("in IRCOT loop")
         new_thought = reason_step(dataset, few_shot_samples, query, retrieved_passages[:top_k], thoughts, client)
         thoughts.append(new_thought)
+        # print(new_thought)
         if 'So the answer is:' in new_thought:
             break
         new_retrieved_passages, new_scores = retrieve_step(new_thought, corpus, top_k, retriever, dataset)
@@ -245,7 +306,7 @@ class DPRRetriever(DocumentRetriever):
         :param model_name:
         :param faiss_index: The path to the faiss index
         """
-        device  = torch.device("mps") 
+        device  = torch.device("cuda") 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModel.from_pretrained(model_name).to(device)
         self.faiss_index = faiss_index
@@ -311,14 +372,14 @@ if __name__ == '__main__':
         vectors = np.load(vector_path)
         print('Vectors loaded:', len(vectors))
 
-    if(True):
+    else:
         # load model
         tokenizer = AutoTokenizer.from_pretrained('facebook/contriever')
         model = AutoModel.from_pretrained('facebook/contriever')
         # Check if multiple GPUs are available and if so, use them all
         """CHANGE THIS FOR SERVER RUN"""
-        if (torch.mps.is_available()):
-            device = torch.device("mps")    
+        if (torch.cuda.is_available()):
+            device = torch.device("cuda")    
             model.to(device)
         else:
             device = torch.device("cpu")
@@ -347,7 +408,7 @@ if __name__ == '__main__':
         if os.path.isfile(index_path):
                 print('index file already exists:', index_path)
                 print('index size: {}'.format(faiss.read_index(index_path).ntotal))
-        if(True):
+        else:
             print('Building index...')
             index = faiss.IndexFlatIP(dim)
             vectors = vectors.astype('float32')
@@ -376,7 +437,7 @@ if __name__ == '__main__':
     if dataset == 'musique':
         data = json.load(open('data/musique.json', 'r'))
         corpus = json.load(open('data/musique_corpus.json', 'r'))
-        # prompt_path = 'data/ircot_prompts/musique/gold_with_3_distractors_context_cot_qa_codex.txt'
+        prompt_path = 'data/ircot_prompts/musique/gold_with_3_distractors_context_cot_qa_codex.txt'
         max_steps = max_steps if max_steps is not None else 4
     elif dataset == '2wikimultihopqa':
         data = json.load(open('data/2wikimultihopqa.json', 'r'))
@@ -386,15 +447,17 @@ if __name__ == '__main__':
     else:
         raise NotImplementedError(f'Dataset {dataset} not implemented')
     
-    doc_ensemble = ''
-    doc_ensemble_str = 'doc_ensemble' if doc_ensemble else 'no_ensemble'
+    # doc_ensemble = ''
+    # doc_ensemble_str = 'doc_ensemble' if doc_ensemble else 'no_ensemble'
     doc_ensemble_str = ''
     alt_model_label = 'facebook_contriever'
     if max_steps > 1:
+        k_list = [1, 2, 5, 8]
         output_path = f'output/ircot/{dataset}_{alt_model_label}_demo_{num_demo}_{llm_model}_{doc_ensemble_str}_step_{max_steps}_top_{top_k}.json'
     else:  # only one step
         top_k = 100
         output_path = f'output/proposition_{dataset}_{alt_model_label}_{doc_ensemble_str}.json'
+        k_list = [1, 2, 5, 10, 15, 20, 30, 50, 100]
     
     if dataset == 'musique':
         faiss_index = faiss.read_index('data/musique/musique_facebook_contriever_proposition_ip_norm.index')
@@ -404,7 +467,7 @@ if __name__ == '__main__':
     model_label = 'facebook/contriever'
     retriever = DPRRetriever(model_label, faiss_index, corpus)
 
-    k_list = [1, 2, 5, 10, 15, 20, 30, 50, 100]
+
     total_recall = {k: 0 for k in k_list}
 
     results = data
@@ -418,39 +481,40 @@ if __name__ == '__main__':
     few_shot_samples = few_shot_samples[:num_demo]
     print('num of demo:', len(few_shot_samples))
 
-    #32 threads
-    with ThreadPoolExecutor(max_workers = 32) as executor:
-        # Submit tasks to the executor
-        futures = [executor.submit(process_sample,idx, sample, dataset, top_k, k_list,max_steps, few_shot_samples, corpus, retriever, client, processed_ids) for idx, sample in enumerate(data)]
+    k_list = [1, 2, 5, 8]
 
-        for future in concurrent.futures.as_completed(futures):
-            idx, recall, retrieved_passages, thoughts, it = future.result()
-
-            # print metrics
-            for k in k_list:
-                total_recall[k] += recall[k]
-                print(f'R@{k}: {total_recall[k] / (idx + 1):.4f} ', end='')
-            print()
-            if max_steps > 1:
-                print('[ITERATION]', it, '[PASSAGE]', len(retrieved_passages), '[THOUGHT]', thoughts)
-
-            # record results
-            results[idx]['retrieved'] = retrieved_passages
-            results[idx]['recall'] = recall
-            results[idx]['thoughts'] = thoughts
-
-            # if idx % 50 == 0:
-            #     f = open(output_path, 'w')
-            #     json.dump(results, f)
-            #     f.close()
+    total_recall = {k: 0 for k in k_list}
+    processed_ids = set()
+    for idx, sample in enumerate(data):
+        idx, recall, retrieved_passages, thoughts, it = process_sample(idx, sample, dataset, top_k, k_list,max_steps, few_shot_samples, corpus, retriever, client, processed_ids) 
+        
+        # print metrics
+        for k in k_list:
+            total_recall[k] += recall[k]
+            print(f'R@{k}: {total_recall[k] / (idx + 1):.4f} ', end='')
+        print()
+        if max_steps > 1:
+            print('[ITERATION]', it, '[PASSAGE]', len(retrieved_passages), '[THOUGHT]', thoughts)
+        
+        # record results
+        results[idx]['retrieved'] = retrieved_passages
+        results[idx]['recall'] = recall
+        results[idx]['thoughts'] = thoughts
+            
+        # if idx % 50 == 0:
+        #     f = open(output_path, 'w')
+        #     json.dump(results, f)
+        #     f.close()
 
     # save results
-    # f = open(output_path, 'w')
-    # json.dump(results, f)
-    # f.close()
+    f = open(output_path, 'w')
+    json.dump(results, f)
+    f.close()
     print(f'Saved results to {output_path}')
     for k in k_list:
         #average recall (across 1,000 questions for musique)
         print(f'R@{k}: {total_recall[k] / len(data):.4f} ', end='')
+
+
 
 
