@@ -83,28 +83,9 @@ def parse_prompt(file_path: str, has_context=True):
 def num_tokens_by_tiktoken(text: str):
     return len(enc.encode(text))
 
-def merge_elements_with_same_first_line(elements, prefix='Wikipedia Title: '):
-    merged_dict = {}
 
-    # Iterate through each element in the list
-    for element in elements:
-        # Split the element into lines and get the first line
-        lines = element.split('\n')
-        first_line = lines[0]
-
-        # Check if the first line is already a key in the dictionary
-        if first_line in merged_dict:
-            # Append the current element to the existing value
-            merged_dict[first_line] += "\n" + element.split(first_line, 1)[1].strip('\n')
-        else:
-            # Add the current element as a new entry in the dictionary
-            merged_dict[first_line] = prefix + element
-
-    # Extract the merged elements from the dictionary
-    merged_elements = list(merged_dict.values())
-    return merged_elements
-
-ircot_reason_instruction = 'You serve as an intelligent assistant, adept at facilitating users through complex, multi-hop reasoning across multiple documents. Your task is to generate the next thought for the current step, DON\'T generate all thoughts at once! If you reach what you believe to be the final step, start with "So the answer is:".'
+# ircot_reason_instruction = 'You serve as an intelligent assistant, adept at facilitating users through complex, multi-hop reasoning across multiple documents. Your task is to generate the next thought for the current step, DON\'T generate all thoughts at once! If you reach what you believe to be the final step, start with "So the answer is:".'
+ircot_reason_instruction = 'You serve as an intelligent assistant, adept at facilitating users through complex, multi-hop reasoning across multiple documents. This task is illustrated through a demonstration consisting of a document set paired with a relevant question and its multi-hop reasoning thoughts, separated by periods. Your task is to generate one thought for current step, DON\'T generate all thoughts at once! If you reach what you believe to be the final step, start with "So the answer is:".'
 
 def reason_step(dataset, few_shot: list, query: str, passages: list, thoughts: list, client):
     """
@@ -112,11 +93,12 @@ def reason_step(dataset, few_shot: list, query: str, passages: list, thoughts: l
     The generated thought is used for further retrieval step.
     :return: next thought
     """
+    # example used for few-shot prompting
     prompt_demo = ''
 
+    #contents from the top k retrieved documents
     prompt_user = ''
-    if dataset in ['hotpotqa']:
-        passages = merge_elements_with_same_first_line(passages)
+
         
     #put into the format of documents in IRCOT tests
     for passage in passages:
@@ -134,53 +116,31 @@ def reason_step(dataset, few_shot: list, query: str, passages: list, thoughts: l
     examples = []
     for sample in few_shot:
         cur_sample = f'{sample["document"]}\n\nQuestion: {sample["question"]}\nThought: {sample["thought_and_answer"]}\n\n'
-        if num_tokens_by_tiktoken(ircot_reason_instruction + prompt_demo + cur_sample + prompt_user) < 15000:
-                examples.append({"input": f'{sample["document"]}\n\nQuestion: {sample["question"]}\nThought: '+sample["thought"], "output": sample["thought_and_answer"]})
+        #token limit
+        if num_tokens_by_tiktoken(ircot_reason_instruction + prompt_demo + cur_sample + prompt_user) < 4096:
+                # examples.append({"input": f'{sample["document"]}\n\nQuestion: {sample["question"]}\nThought: '+sample["thought"], "output": sample["thought_and_answer"]})
+                prompt_demo += cur_sample
 
-    # print(examples)
+    messages = ChatPromptTemplate.from_messages([("system", ircot_reason_instruction + '\n\n' + prompt_demo),
+                                                 ("human", prompt_user)])
 
-    # print(cur_sample)
+    
 
-    # print("Prompt Demo:")
-    # print(prompt_demo)
-
-    example_prompt = ChatPromptTemplate.from_messages(
-        [
-            ("human", "{input}"),
-            ("ai", "{output}"),
-        ]
-    )
-
-    # print("input")
-    # print(f'{sample["document"]}\n\nQuestion: {sample["question"]}')
-
-    # print("output")
-    # print(sample["thought_and_answer"])
-
-
-
-    few_shot_prompt = FewShotChatMessagePromptTemplate(
-        example_prompt=example_prompt,
-        examples=examples,
-    )
-
-    final_prompt = ChatPromptTemplate.from_messages(
-        [
-            ("system", ircot_reason_instruction),
-            few_shot_prompt,
-            ("human", "{input}"),
-        ]
-    )
-
-
-#     messages = ChatPromptTemplate([("system", ircot_reason_instruction + '\n\n' + prompt_demo),
-#                                                  ("human", "{prompt_user}")])
-    # print(messages.to_messages())
+    # for retry in range(5):
+    #     try:
+    #         chain = final_prompt | client
+    #         chat_completion = chain.invoke({"input":prompt_user})
+    #         response_content = chat_completion.content
+    #         return response_content
+    #         # print(response_content)
+    #     except openai.RateLimitError as e:
+    #         print("Rate Limit Exceeded. Trying again")
+    #         wait_time = 2 ** retry  # Exponential backoff
+    #         time.sleep(wait_time)
 
     for retry in range(5):
         try:
-            chain = final_prompt | client
-            chat_completion = chain.invoke({"input":prompt_user})
+            chat_completion = client.invoke(messages.format_messages())
             response_content = chat_completion.content
             return response_content
             # print(response_content)
@@ -202,7 +162,7 @@ def mean_pooling(tokenEmbeddings, paddingInfo):
     return sentenceEmbeddings
 
 def mean_pooling_embedding_with_normalization(batch_str, tokenizer, model):
-    encoding = tokenizer(batch_str, padding=True, truncation=True, return_tensors='pt').to(mps_device)
+    encoding = tokenizer(batch_str, padding=True, truncation=True, return_tensors='pt')
     input_ids = encoding['input_ids']
     attention_mask = encoding['attention_mask']
     if(torch.cuda.is_available()):
@@ -224,7 +184,7 @@ def process_sample(idx, sample, dataset, top_k, k_list,max_steps, few_shot_sampl
     # Check if the sample has already been processed
     if dataset in ['hotpotqa', '2wikimultihopqa']:
         sample_id = sample['_id']
-    elif dataset in ['musique']:
+    elif dataset == 'musique':
         sample_id = sample['id']
     else:
         raise NotImplementedError(f'Dataset {dataset} not implemented')
@@ -245,6 +205,7 @@ def process_sample(idx, sample, dataset, top_k, k_list,max_steps, few_shot_sampl
     for it in range(1, max_steps):
         print("in IRCOT loop")
         new_thought = reason_step(dataset, few_shot_samples, query, retrieved_passages[:top_k], thoughts, client)
+        # print(new_thought)
         thoughts.append(new_thought)
         # print(new_thought)
         if 'So the answer is:' in new_thought:
@@ -306,7 +267,10 @@ class DPRRetriever(DocumentRetriever):
         :param model_name:
         :param faiss_index: The path to the faiss index
         """
-        device  = torch.device("cuda") 
+        if(torch.cuda.is_available()):
+            device  = torch.device("cuda") 
+        else:
+            device  = torch.device("cpu") 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModel.from_pretrained(model_name).to(device)
         self.faiss_index = faiss_index
@@ -473,9 +437,10 @@ if __name__ == '__main__':
     results = data
     processed_ids = set()
     
-    load_dotenv()
+    load_dotenv('/Users/amarkanaka/repos/RAG/.env')
+    print(os.getenv("OPENAI_API_KEY"))
     #Create OpenAI Client
-    client = ChatOpenAI(api_key=os.environ.get("OPENAI_API_KEY"), model=llm_model, temperature=0.0, max_retries=5, timeout=60)
+    client = ChatOpenAI(api_key=os.getenv("OPENAI_API_KEY"), model=llm_model, temperature=0.0, max_retries=5, timeout=60)
     
     few_shot_samples = parse_prompt(prompt_path)
     few_shot_samples = few_shot_samples[:num_demo]
@@ -485,6 +450,7 @@ if __name__ == '__main__':
 
     total_recall = {k: 0 for k in k_list}
     processed_ids = set()
+    
     for idx, sample in enumerate(data):
         idx, recall, retrieved_passages, thoughts, it = process_sample(idx, sample, dataset, top_k, k_list,max_steps, few_shot_samples, corpus, retriever, client, processed_ids) 
         
