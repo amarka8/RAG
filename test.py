@@ -1,4 +1,6 @@
+import asyncio
 import os
+import random
 # import sys
 
 # from src.processing import mean_pooling, mean_pooling_embedding_with_normalization
@@ -9,6 +11,8 @@ import argparse
 import json
 import numpy as np
 import time
+import backoff
+
 
 import faiss
 import torch
@@ -25,6 +29,36 @@ import openai
 import tiktoken
 from langchain_openai import ChatOpenAI
 from dotenv import load_dotenv
+
+"""
+methods for generating embeddings
+"""
+
+def mean_pooling(tokenEmbeddings, paddingInfo):
+    tokenEmbeddingsNoPad = tokenEmbeddings.masked_fill(~paddingInfo[...,None].bool(), 0)
+    sentenceEmbeddings = tokenEmbeddingsNoPad.sum(dim = 1) / paddingInfo.sum(dim = 1)[...,None]
+    return sentenceEmbeddings
+
+def mean_pooling_embedding_with_normalization(batch_str, tokenizer, model):
+    encoding = tokenizer(batch_str, padding=True, truncation=True, return_tensors='pt')
+    input_ids = encoding['input_ids']
+    attention_mask = encoding['attention_mask']
+    if(torch.cuda.is_available()):
+        cuda_device = torch.device("cuda") 
+        input_ids = input_ids.to(cuda_device)
+        attention_mask = attention_mask.to(cuda_device)
+    else:
+        cuda_device = torch.device("cpu") 
+        input_ids = input_ids.to(cuda_device)
+        attention_mask = attention_mask.to(cuda_device)
+    outputs = model(input_ids, attention_mask=attention_mask)
+    sentenceEmbeddings = mean_pooling(outputs[0], attention_mask)
+    sentenceEmbeddingsNorm = sentenceEmbeddings.divide(torch.linalg.norm(sentenceEmbeddings,dim = 1)[...,None])
+    return sentenceEmbeddingsNorm    
+
+"""
+end of methods for generating embeddings
+"""
 
 """
 Methods for multistep retrieval
@@ -85,7 +119,24 @@ def num_tokens_by_tiktoken(text: str):
 
 
 # ircot_reason_instruction = 'You serve as an intelligent assistant, adept at facilitating users through complex, multi-hop reasoning across multiple documents. Your task is to generate the next thought for the current step, DON\'T generate all thoughts at once! If you reach what you believe to be the final step, start with "So the answer is:".'
-ircot_reason_instruction = 'You serve as an intelligent assistant, adept at facilitating users through complex, multi-hop reasoning across multiple documents. This task is illustrated through a demonstration consisting of a document set paired with a relevant question and its multi-hop reasoning thoughts, separated by periods. Your task is to generate one thought for current step, DON\'T generate all thoughts at once! If you reach what you believe to be the final step, start with "So the answer is:".'
+ircot_reason_instruction = 'You serve as an intelligent assistant, adept at facilitating users through complex, multi-hop reasoning across multiple documents. This task is illustrated through a demonstration consisting of a document set paired with a relevant question and its multi-hop reasoning thoughts, delineated by the string "Thought". Your task is to generate one thought for current step, DON\'T generate all thoughts at once! If you reach what you believe to be the final step, start with "So the answer is:".'
+
+@backoff.on_exception(backoff.expo, openai.RateLimitError)
+async def make_api_call_to_gpt(prompt, prompt_demo, model="gpt-3.5-turbo"):
+    response = await client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "developer", "content": ircot_reason_instruction + '\n\n' + prompt_demo},
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        temperature = 0,
+        timeout=60, 
+        max_tokens = 400
+    )
+    return response.choices[0].message.content
 
 def reason_step(dataset, few_shot: list, query: str, passages: list, thoughts: list, client):
     """
@@ -93,6 +144,17 @@ def reason_step(dataset, few_shot: list, query: str, passages: list, thoughts: l
     The generated thought is used for further retrieval step.
     :return: next thought
     """
+    # #handle rate limit errors
+    # seconds_to_pause_after_rate_limit_error = 15
+    # seconds_to_sleep_each_loop = (
+    #         0.001  # 1 ms limits max throughput to 1,000 requests per second
+    # )
+    # available_request_capacity = 500
+    # available_token_capacity = 200000
+    # last_update_time = time.time()
+
+    # queue_of_requests_to_retry = asyncio.Queue()
+
     # example used for few-shot prompting
     prompt_demo = ''
 
@@ -105,82 +167,25 @@ def reason_step(dataset, few_shot: list, query: str, passages: list, thoughts: l
         prompt_user += f'Wikipedia Title: {passage}\n\n'
     prompt_user += f'Question: {query}\nThought:' + ' '.join(thoughts)
 
-    # print("Passages: ")
-    # print(passages)
-    
-    # print("Prompt User:")
-    # print(prompt_user)
-
-    # print("Cur_sample:")
-
-    examples = []
     for sample in few_shot:
         cur_sample = f'{sample["document"]}\n\nQuestion: {sample["question"]}\nThought: {sample["thought_and_answer"]}\n\n'
-        #token limit
+        # return num_tokens_by_tiktoken(ircot_reason_instruction + prompt_demo + cur_sample + prompt_user)
+    #     #token limit
         if num_tokens_by_tiktoken(ircot_reason_instruction + prompt_demo + cur_sample + prompt_user) < 4096:
                 # examples.append({"input": f'{sample["document"]}\n\nQuestion: {sample["question"]}\nThought: '+sample["thought"], "output": sample["thought_and_answer"]})
                 prompt_demo += cur_sample
 
-    messages = ChatPromptTemplate.from_messages([("system", ircot_reason_instruction + '\n\n' + prompt_demo),
-                                                 ("human", prompt_user)])
+    # messages = ChatPromptTemplate.from_messages([("system", ircot_reason_instruction + '\n\n' + prompt_demo),
+    #                                              ("human", prompt_user)])
+
+    return make_api_call_to_gpt(prompt_user, prompt_demo)
+
+
+
+async def process_sample(idx, sample, dataset, top_k, k_list,max_steps, few_shot_samples, corpus, retriever, client, processed_ids):
+
 
     
-
-    # for retry in range(5):
-    #     try:
-    #         chain = final_prompt | client
-    #         chat_completion = chain.invoke({"input":prompt_user})
-    #         response_content = chat_completion.content
-    #         return response_content
-    #         # print(response_content)
-    #     except openai.RateLimitError as e:
-    #         print("Rate Limit Exceeded. Trying again")
-    #         wait_time = 2 ** retry  # Exponential backoff
-    #         time.sleep(wait_time)
-
-    for retry in range(5):
-        try:
-            chat_completion = client.invoke(messages.format_messages())
-            response_content = chat_completion.content
-            return response_content
-            # print(response_content)
-        except openai.RateLimitError as e:
-            print("Rate Limit Exceeded. Trying again")
-            wait_time = 2 ** retry  # Exponential backoff
-            time.sleep(wait_time)
-
-
-
-
-"""
-methods for generating embeddings
-"""
-
-def mean_pooling(tokenEmbeddings, paddingInfo):
-    tokenEmbeddingsNoPad = tokenEmbeddings.masked_fill(~paddingInfo[...,None].bool(), 0)
-    sentenceEmbeddings = tokenEmbeddingsNoPad.sum(dim = 1) / paddingInfo.sum(dim = 1)[...,None]
-    return sentenceEmbeddings
-
-def mean_pooling_embedding_with_normalization(batch_str, tokenizer, model):
-    encoding = tokenizer(batch_str, padding=True, truncation=True, return_tensors='pt')
-    input_ids = encoding['input_ids']
-    attention_mask = encoding['attention_mask']
-    if(torch.cuda.is_available()):
-        cuda_device = torch.device("cuda") 
-        input_ids = input_ids.to(cuda_device)
-        attention_mask = attention_mask.to(cuda_device)
-    else:
-        cuda_device = torch.device("cpu") 
-        input_ids = input_ids.to(cuda_device)
-        attention_mask = attention_mask.to(cuda_device)
-    outputs = model(input_ids, attention_mask=attention_mask)
-    sentenceEmbeddings = mean_pooling(outputs[0], attention_mask)
-    sentenceEmbeddingsNorm = sentenceEmbeddings.divide(torch.linalg.norm(sentenceEmbeddings,dim = 1)[...,None])
-    return sentenceEmbeddingsNorm
-
-
-
-def process_sample(idx, sample, dataset, top_k, k_list,max_steps, few_shot_samples, corpus, retriever, client, processed_ids):
     # Check if the sample has already been processed
     if dataset in ['hotpotqa', '2wikimultihopqa']:
         sample_id = sample['_id']
@@ -205,6 +210,7 @@ def process_sample(idx, sample, dataset, top_k, k_list,max_steps, few_shot_sampl
     for it in range(1, max_steps):
         print("in IRCOT loop")
         new_thought = reason_step(dataset, few_shot_samples, query, retrieved_passages[:top_k], thoughts, client)
+        # return new_thought
         # print(new_thought)
         thoughts.append(new_thought)
         # print(new_thought)
@@ -297,7 +303,33 @@ def retrieve_step(query: str, corpus, top_k: int, retriever: DocumentRetriever, 
         raise NotImplementedError(f'Dataset {dataset} not implemented')
     return retrieved_passages, scores
 
-#either musique dataset or 2wikimultihopqa dataset
+async def routine():
+    prompts = ["Hello, ChatGPT!", "How does async programming work?"]
+
+    # Create a list to store the results of asynchronous calls
+    final_results = []
+
+    # Asynchronously call the function for each prompt
+    tasks = [process_sample(idx, sample, dataset, top_k, k_list,max_steps, few_shot_samples, corpus, retriever, client, processed_ids) for idx, sample in enumerate(data)]
+
+    # Gather and run the tasks concurrently
+    final_results = await asyncio.gather(*tasks)
+    for result in final_results:
+        idx, recall, retrieved_passages, thoughts, it = result
+        for k in k_list:
+            total_recall[k] += recall[k]
+            print(f'R@{k}: {total_recall[k] / (idx + 1):.4f} ', end='')
+        print()
+        if max_steps > 1:
+            print('[ITERATION]', it, '[PASSAGE]', len(retrieved_passages), '[THOUGHT]', thoughts)
+        
+        # record results
+        results[idx]['retrieved'] = retrieved_passages
+        results[idx]['recall'] = recall
+        results[idx]['thoughts'] = thoughts
+            
+    
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset',type = str)
@@ -437,10 +469,10 @@ if __name__ == '__main__':
     results = data
     processed_ids = set()
     
-    load_dotenv('/Users/amarkanaka/repos/RAG/.env')
+    load_dotenv('.env')
     print(os.getenv("OPENAI_API_KEY"))
     #Create OpenAI Client
-    client = ChatOpenAI(api_key=os.getenv("OPENAI_API_KEY"), model=llm_model, temperature=0.0, max_retries=5, timeout=60)
+    client = openai.AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"), model=llm_model, temperature=0.0, max_retries=5, timeout=60, max_tokens = 400)
     
     few_shot_samples = parse_prompt(prompt_path)
     few_shot_samples = few_shot_samples[:num_demo]
@@ -450,37 +482,80 @@ if __name__ == '__main__':
 
     total_recall = {k: 0 for k in k_list}
     processed_ids = set()
-    
-    for idx, sample in enumerate(data):
-        idx, recall, retrieved_passages, thoughts, it = process_sample(idx, sample, dataset, top_k, k_list,max_steps, few_shot_samples, corpus, retriever, client, processed_ids) 
-        
-        # print metrics
-        for k in k_list:
-            total_recall[k] += recall[k]
-            print(f'R@{k}: {total_recall[k] / (idx + 1):.4f} ', end='')
-        print()
-        if max_steps > 1:
-            print('[ITERATION]', it, '[PASSAGE]', len(retrieved_passages), '[THOUGHT]', thoughts)
-        
-        # record results
-        results[idx]['retrieved'] = retrieved_passages
-        results[idx]['recall'] = recall
-        results[idx]['thoughts'] = thoughts
-            
-        # if idx % 50 == 0:
-        #     f = open(output_path, 'w')
-        #     json.dump(results, f)
-        #     f.close()
 
+    #rpm: 500
+    #tpm: 10,000 
+
+    asyncio.run(routine())
     # save results
-    f = open(output_path, 'w')
-    json.dump(results, f)
-    f.close()
+    # f = open(output_path, 'w')
+    # json.dump(results, f)
+    # f.close()
     print(f'Saved results to {output_path}')
     for k in k_list:
-        #average recall (across 1,000 questions for musique)
+            # average recall (across 1,000 questions for musique)
         print(f'R@{k}: {total_recall[k] / len(data):.4f} ', end='')
 
+    # with concurrent.futures.ProcessPoolExecutor() as executor:
+    #     results = executor.submit(process_sample)
+    #     process_method_results = [executor.submit(process_sample,idx, sample, dataset, top_k, k_list,max_steps, few_shot_samples, corpus, retriever, client, processed_ids) for idx, sample in enumerate(data)]
+
+    #     for result in concurrent.futures.as_completed(process_method_results):
+    #         idx, recall, retrieved_passages, thoughts, it = result.result()
+    #         for k in k_list:
+    #             total_recall[k] += recall[k]
+    #             print(f'R@{k}: {total_recall[k] / (idx + 1):.4f} ', end='')
+    #         print()
+    #         if max_steps > 1:
+    #             print('[ITERATION]', it, '[PASSAGE]', len(retrieved_passages), '[THOUGHT]', thoughts)
+            
+    #         # record results
+    #         results[idx]['retrieved'] = retrieved_passages
+    #         results[idx]['recall'] = recall
+    #         results[idx]['thoughts'] = thoughts
+                
+    #         if idx % 50 == 0:
+    #             f = open(output_path, 'w')
+    #             json.dump(results, f)
+    #             f.close()
+
+    #         # save results
+    #         f = open(output_path, 'w')
+    #         json.dump(results, f)
+    #         f.close()
+    #         print(f'Saved results to {output_path}')
+    #         for k in k_list:
+                # average recall (across 1,000 questions for musique)
+                # print(f'R@{k}: {total_recall[k] / len(data):.4f} ', end='')
+    
+    # for idx in range(5):
+        # idx, recall, retrieved_passages, thoughts, it = process_sample(idx, data[idx], dataset, top_k, k_list,max_steps, few_shot_samples, corpus, retriever, client, processed_ids) 
+    #     # print metrics
+    #     for k in k_list:
+    #         total_recall[k] += recall[k]
+    #         print(f'R@{k}: {total_recall[k] / (idx + 1):.4f} ', end='')
+    #     print()
+    #     if max_steps > 1:
+    #         print('[ITERATION]', it, '[PASSAGE]', len(retrieved_passages), '[THOUGHT]', thoughts)
+        
+    #     # record results
+    #     results[idx]['retrieved'] = retrieved_passages
+    #     results[idx]['recall'] = recall
+    #     results[idx]['thoughts'] = thoughts
+            
+    #     # if idx % 50 == 0:
+    #     #     f = open(output_path, 'w')
+    #     #     json.dump(results, f)
+    #     #     f.close()
+
+    # # save results
+    # f = open(output_path, 'w')
+    # json.dump(results, f)
+    # f.close()
+    # print(f'Saved results to {output_path}')
+    # for k in k_list:
+    #     #average recall (across 1,000 questions for musique)
+    #     print(f'R@{k}: {total_recall[k] / len(data):.4f} ', end='')
 
 
 
