@@ -122,8 +122,8 @@ def num_tokens_by_tiktoken(text: str):
 ircot_reason_instruction = 'You serve as an intelligent assistant, adept at facilitating users through complex, multi-hop reasoning across multiple documents. This task is illustrated through a demonstration consisting of a document set paired with a relevant question and its multi-hop reasoning thoughts, delineated by the string "Thought". Your task is to generate one thought for current step, DON\'T generate all thoughts at once! If you reach what you believe to be the final step, start with "So the answer is:".'
 
 @backoff.on_exception(backoff.expo, openai.RateLimitError)
-async def make_api_call_to_gpt(prompt, prompt_demo, model="gpt-3.5-turbo"):
-    response = await client.chat.completions.create(
+def make_api_call_to_gpt(prompt, prompt_demo, model="gpt-3.5-turbo"):
+    response = client.chat.completions.create(
         model="gpt-3.5-turbo",
         messages=[
             {"role": "developer", "content": ircot_reason_instruction + '\n\n' + prompt_demo},
@@ -182,7 +182,7 @@ def reason_step(dataset, few_shot: list, query: str, passages: list, thoughts: l
 
 
 
-async def process_sample(idx, sample, dataset, top_k, k_list,max_steps, few_shot_samples, corpus, retriever, client, processed_ids):
+def process_sample(idx, sample, dataset, top_k, k_list,max_steps, few_shot_samples, corpus, retriever, client, processed_ids):
 
 
     
@@ -303,30 +303,6 @@ def retrieve_step(query: str, corpus, top_k: int, retriever: DocumentRetriever, 
         raise NotImplementedError(f'Dataset {dataset} not implemented')
     return retrieved_passages, scores
 
-async def routine():
-    prompts = ["Hello, ChatGPT!", "How does async programming work?"]
-
-    # Create a list to store the results of asynchronous calls
-    final_results = []
-
-    # Asynchronously call the function for each prompt
-    tasks = [process_sample(idx, sample, dataset, top_k, k_list,max_steps, few_shot_samples, corpus, retriever, client, processed_ids) for idx, sample in enumerate(data)]
-
-    # Gather and run the tasks concurrently
-    final_results = await asyncio.gather(*tasks)
-    for result in final_results:
-        idx, recall, retrieved_passages, thoughts, it = result
-        for k in k_list:
-            total_recall[k] += recall[k]
-            print(f'R@{k}: {total_recall[k] / (idx + 1):.4f} ', end='')
-        print()
-        if max_steps > 1:
-            print('[ITERATION]', it, '[PASSAGE]', len(retrieved_passages), '[THOUGHT]', thoughts)
-        
-        # record results
-        results[idx]['retrieved'] = retrieved_passages
-        results[idx]['recall'] = recall
-        results[idx]['thoughts'] = thoughts
             
     
 
@@ -470,9 +446,9 @@ if __name__ == '__main__':
     processed_ids = set()
     
     load_dotenv('.env')
-    print(os.getenv("OPENAI_API_KEY"))
+    # print(os.getenv("OPENAI_API_KEY"))
     #Create OpenAI Client
-    client = openai.AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"), model=llm_model, temperature=0.0, max_retries=5, timeout=60, max_tokens = 400)
+    client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     
     few_shot_samples = parse_prompt(prompt_path)
     few_shot_samples = few_shot_samples[:num_demo]
@@ -486,76 +462,34 @@ if __name__ == '__main__':
     #rpm: 500
     #tpm: 10,000 
 
-    asyncio.run(routine())
+    
+    for idx in range(len(data)):
+        idx, recall, retrieved_passages, thoughts, it = process_sample(idx, data[idx], dataset, top_k, k_list,max_steps, few_shot_samples, corpus, retriever, client, processed_ids) 
+        # print metrics
+        for k in k_list:
+            total_recall[k] += recall[k]
+            print(f'R@{k}: {total_recall[k] / (idx + 1):.4f} ', end='')
+        print()
+        if max_steps > 1:
+            print('[ITERATION]', it, '[PASSAGE]', len(retrieved_passages), '[THOUGHT]', thoughts)
+        
+        # record results
+        results[idx]['retrieved'] = retrieved_passages
+        results[idx]['recall'] = recall
+        results[idx]['thoughts'] = thoughts
+            
+        # if idx % 50 == 0:
+        #     f = open(output_path, 'w')
+        #     json.dump(results, f)
+        #     f.close()
+
     # save results
-    # f = open(output_path, 'w')
-    # json.dump(results, f)
-    # f.close()
+    f = open(output_path, 'w')
+    json.dump(results, f)
+    f.close()
     print(f'Saved results to {output_path}')
     for k in k_list:
-            # average recall (across 1,000 questions for musique)
+        #average recall (across 1,000 questions for musique)
         print(f'R@{k}: {total_recall[k] / len(data):.4f} ', end='')
-
-    # with concurrent.futures.ProcessPoolExecutor() as executor:
-    #     results = executor.submit(process_sample)
-    #     process_method_results = [executor.submit(process_sample,idx, sample, dataset, top_k, k_list,max_steps, few_shot_samples, corpus, retriever, client, processed_ids) for idx, sample in enumerate(data)]
-
-    #     for result in concurrent.futures.as_completed(process_method_results):
-    #         idx, recall, retrieved_passages, thoughts, it = result.result()
-    #         for k in k_list:
-    #             total_recall[k] += recall[k]
-    #             print(f'R@{k}: {total_recall[k] / (idx + 1):.4f} ', end='')
-    #         print()
-    #         if max_steps > 1:
-    #             print('[ITERATION]', it, '[PASSAGE]', len(retrieved_passages), '[THOUGHT]', thoughts)
-            
-    #         # record results
-    #         results[idx]['retrieved'] = retrieved_passages
-    #         results[idx]['recall'] = recall
-    #         results[idx]['thoughts'] = thoughts
-                
-    #         if idx % 50 == 0:
-    #             f = open(output_path, 'w')
-    #             json.dump(results, f)
-    #             f.close()
-
-    #         # save results
-    #         f = open(output_path, 'w')
-    #         json.dump(results, f)
-    #         f.close()
-    #         print(f'Saved results to {output_path}')
-    #         for k in k_list:
-                # average recall (across 1,000 questions for musique)
-                # print(f'R@{k}: {total_recall[k] / len(data):.4f} ', end='')
-    
-    # for idx in range(5):
-        # idx, recall, retrieved_passages, thoughts, it = process_sample(idx, data[idx], dataset, top_k, k_list,max_steps, few_shot_samples, corpus, retriever, client, processed_ids) 
-    #     # print metrics
-    #     for k in k_list:
-    #         total_recall[k] += recall[k]
-    #         print(f'R@{k}: {total_recall[k] / (idx + 1):.4f} ', end='')
-    #     print()
-    #     if max_steps > 1:
-    #         print('[ITERATION]', it, '[PASSAGE]', len(retrieved_passages), '[THOUGHT]', thoughts)
-        
-    #     # record results
-    #     results[idx]['retrieved'] = retrieved_passages
-    #     results[idx]['recall'] = recall
-    #     results[idx]['thoughts'] = thoughts
-            
-    #     # if idx % 50 == 0:
-    #     #     f = open(output_path, 'w')
-    #     #     json.dump(results, f)
-    #     #     f.close()
-
-    # # save results
-    # f = open(output_path, 'w')
-    # json.dump(results, f)
-    # f.close()
-    # print(f'Saved results to {output_path}')
-    # for k in k_list:
-    #     #average recall (across 1,000 questions for musique)
-    #     print(f'R@{k}: {total_recall[k] / len(data):.4f} ', end='')
-
 
 
