@@ -8,4 +8,6 @@ A Beginner's Attempt to Build a RAG System
     1. created normalized vectorized embeddings from text corpuses and indexed them (used FAISS and cosine similarity as metric) on GPU
 3. 12/29/2024
     1. Finished rough draft 1 of source code. Next step is to create miniconda3/envs/env-name folder in home file and install necessary modules
+4. 1/1/2025
+    1. Created index using FAISS and SentenceTransformer. Remaining steps are to calculate recall and run tests then migrate to server and run on GPU with multithreading.
     
