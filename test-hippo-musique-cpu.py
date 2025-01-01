@@ -378,10 +378,10 @@ if __name__ == '__main__':
             index.add(vectors)
 
             # save faiss index to file
-            # fp = open(index_path, 'w')
-            # faiss.write_index(index, index_path)
-            # print('index saved to {}'.format(index_path))
-            # print('index size: {}'.format(index.ntotal))
+            fp = open(index_path, 'w')
+            faiss.write_index(index, index_path)
+            print('index saved to {}'.format(index_path))
+            print('index size: {}'.format(index.ntotal))
 
     llm_model = 'gpt-3.5-turbo-1106'
     llm = 'openai'
