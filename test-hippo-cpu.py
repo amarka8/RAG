@@ -334,6 +334,7 @@ if __name__ == '__main__':
         print('Loading existing vectors:', vector_path)
         vectors = np.load(vector_path)
         print('Vectors loaded:', len(vectors))
+        print("shape: ",vectors.shape)
 
     else:
         # load model
