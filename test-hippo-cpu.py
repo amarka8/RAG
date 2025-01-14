@@ -9,6 +9,7 @@ import backoff
 import faiss
 import torch
 # from tqdm import tqdm
+import transformers
 from transformers import AutoTokenizer, AutoModel
 
 from abc import abstractmethod
@@ -260,7 +261,7 @@ class DPRRetriever(DocumentRetriever):
         :param faiss_index: The path to the faiss index
         """
         if(torch.cuda.is_available()):
-            device  = torch.device("cuda") 
+            device  = torch.device("cuda:0") 
         else:
             device  = torch.device("cpu") 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name).to(device)
