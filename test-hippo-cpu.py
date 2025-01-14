@@ -12,13 +12,9 @@ import torch
 from transformers import AutoTokenizer, AutoModel
 
 from abc import abstractmethod
-import concurrent.futures
-from concurrent.futures import ThreadPoolExecutor
 
 import openai
 import tiktoken
-from langchain_openai import ChatOpenAI
-from dotenv import load_dotenv
 
 """
 methods for generating embeddings
@@ -34,7 +30,7 @@ def mean_pooling_embedding_with_normalization(batch_str, tokenizer, model):
     input_ids = encoding['input_ids']
     attention_mask = encoding['attention_mask']
     if(torch.cuda.is_available()):
-        cuda_device = torch.device("cuda") 
+        cuda_device = torch.device("cuda:0") 
         input_ids = input_ids.to(cuda_device)
         attention_mask = attention_mask.to(cuda_device)
     else:
@@ -315,8 +311,8 @@ if __name__ == '__main__':
 
 
     model_label = 'facebook_contriever'
-    vector_path = f'data/{dataset}/{dataset}_{model_label}_proposition_vectors_norm.npy'
-    index_path = f'data/{dataset}/{dataset}_{model_label}_proposition_ip_norm.index'
+    vector_path = f'data/{dataset}/{dataset}_{model_label}_vectors_norm.npy'
+    index_path = f'data/{dataset}/{dataset}_{model_label}_ip_norm.index'
 
 
     if dataset == 'musique':
@@ -343,13 +339,13 @@ if __name__ == '__main__':
         # Check if multiple GPUs are available and if so, use them all
         """CHANGE THIS FOR SERVER RUN"""
         if (torch.cuda.is_available()):
-            device = torch.device("cuda")    
+            device = torch.device("cuda:0")    
             model.to(device)
         else:
             device = torch.device("cpu")
             model.to(device)
         #test batch size = 16 and batch size = 32 
-        batch_size = 16
+        batch_size = 32
         vectors = np.zeros((len(corpus_contents), dim))
         #get batch_size number of entries from corpus_contents, tokenize and embed them in 768 dimensional space
         for idx in range(0, len(corpus_contents), batch_size):
@@ -424,9 +420,9 @@ if __name__ == '__main__':
         k_list = [1, 2, 5, 10, 15, 20, 30, 50, 100]
     
     if dataset == 'musique':
-        faiss_index = faiss.read_index('data/musique/musique_facebook_contriever_proposition_ip_norm.index')
+        faiss_index = faiss.read_index('data/musique/musique_facebook_contriever_ip_norm.index')
     else:
-        faiss_index = faiss.read_index('data/2wikimultihopqa/2wikimultihopqa_facebook_contriever_proposition_ip_norm.index')
+        faiss_index = faiss.read_index('data/2wikimultihopqa/2wikimultihopqa_facebook_contriever_ip_norm.index')
         
     model_label = 'facebook/contriever'
     retriever = DPRRetriever(model_label, faiss_index, corpus)
@@ -437,10 +433,10 @@ if __name__ == '__main__':
     results = data
     processed_ids = set()
     
-    load_dotenv('.env')
     # print(os.getenv("OPENAI_API_KEY"))
     #Create OpenAI Client
-    client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    api_key = input("Please enter your OpenAI API key: ")
+    client = openai.OpenAI(api_key=api_key)
     
     few_shot_samples = parse_prompt(prompt_path)
     few_shot_samples = few_shot_samples[:num_demo]
